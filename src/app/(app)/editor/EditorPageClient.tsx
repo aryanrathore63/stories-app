@@ -1,0 +1,568 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Controller, useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { PenLine, Star, Tag, X } from "lucide-react";
+import { toast } from "sonner";
+import {
+  createStory,
+  getStory,
+  publishStory,
+  saveDraftFlexible,
+  updateStory,
+} from "@/services/stories.service";
+import { getApiErrorMessage } from "@/services/api";
+import { PageLoader } from "@/components/ui/loader";
+import { Modal } from "@/components/ui/modal";
+import { EditorToolbar } from "@/components/editor/EditorToolbar";
+import {
+  RichMarkdownEditor,
+  type RichMarkdownEditorHandle,
+} from "@/components/editor/RichMarkdownEditor";
+import { cn } from "@/lib/cn";
+import { randomPicsumCoverCandidates } from "@/lib/picsum";
+import {
+  EDITOR_TIP_IMAGE,
+  pickRandomEditorTip,
+} from "@/lib/editor-tips";
+import { useEditorChromeStore } from "@/store/editorChromeStore";
+
+const schema = z.object({
+  title: z.string().max(200),
+  content: z.string().max(100_000),
+});
+
+type Form = z.infer<typeof schema>;
+
+function normalizeInternalHref(href: string): string {
+  if (href.startsWith("/")) {
+    const hash = href.indexOf("#");
+    return hash >= 0 ? href.slice(0, hash) : href;
+  }
+  try {
+    const u = new URL(href);
+    return u.pathname + u.search;
+  } catch {
+    return href;
+  }
+}
+
+function isSameDocumentLocation(href: string): boolean {
+  if (!href.startsWith("/") && !href.startsWith("http")) return false;
+  const path = normalizeInternalHref(href);
+  const here = window.location.pathname + window.location.search;
+  return path === here;
+}
+
+function isInternalNavHref(href: string): boolean {
+  if (!href || href.startsWith("#") || href.startsWith("mailto:") || href.startsWith("tel:")) {
+    return false;
+  }
+  if (href.startsWith("/")) return true;
+  try {
+    return new URL(href).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
+export function EditorPageClient() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const existingId = searchParams.get("id");
+  const [storyId, setStoryId] = useState<string | null>(existingId);
+  const [initializing, setInitializing] = useState(true);
+  const saving = useEditorChromeStore((s) => s.saving);
+  const [savedSnapshot, setSavedSnapshot] = useState<{
+    title: string;
+    content: string;
+    bgimg: string | null;
+  } | null>(null);
+  const [bgimg, setBgimg] = useState<string | null>(null);
+  const [coverPickerOpen, setCoverPickerOpen] = useState(false);
+  const [coverCandidates, setCoverCandidates] = useState<string[]>([]);
+  const [leaveModalOpen, setLeaveModalOpen] = useState(false);
+  const [pendingHref, setPendingHref] = useState<string | null>(null);
+  const richEditorHandle = useRef<RichMarkdownEditorHandle>(null);
+  const richRootRef = useRef<HTMLDivElement>(null);
+  const [tags, setTags] = useState<string[]>(["Minimalism", "Lifestyle"]);
+  const [tagInput, setTagInput] = useState("");
+  const [editorTip] = useState(() => pickRandomEditorTip());
+
+  const {
+    register,
+    control,
+    watch,
+    handleSubmit,
+    reset,
+    getValues,
+    setValue,
+    formState: { errors },
+  } = useForm<Form>({
+    resolver: zodResolver(schema),
+    defaultValues: { title: "", content: "" },
+  });
+
+  const setContentValue = useCallback(
+    (v: string) => setValue("content", v, { shouldDirty: true, shouldValidate: true }),
+    [setValue],
+  );
+
+  const title = watch("title");
+  const content = watch("content");
+
+  const isDirty = useMemo(() => {
+    if (savedSnapshot === null) return false;
+    return (
+      (title ?? "") !== savedSnapshot.title ||
+      (content ?? "") !== savedSnapshot.content ||
+      (bgimg ?? "") !== (savedSnapshot.bgimg ?? "")
+    );
+  }, [title, content, bgimg, savedSnapshot]);
+
+  const bootstrap = useCallback(async () => {
+    setInitializing(true);
+    setSavedSnapshot(null);
+    try {
+      if (existingId) {
+        const s = await getStory(existingId);
+        const b = s.bgimg?.trim() ?? null;
+        setBgimg(b);
+        reset({ title: s.title ?? "", content: s.content ?? "" });
+        setSavedSnapshot({
+          title: s.title ?? "",
+          content: s.content ?? "",
+          bgimg: b,
+        });
+        setStoryId(s.id);
+      } else {
+        setStoryId(null);
+        setBgimg(null);
+        reset({ title: "", content: "" });
+        setSavedSnapshot({ title: "", content: "", bgimg: null });
+      }
+    } catch (e) {
+      toast.error(getApiErrorMessage(e, "Could not open editor"));
+    } finally {
+      setInitializing(false);
+    }
+  }, [existingId, reset]);
+
+  useEffect(() => {
+    void bootstrap();
+  }, [bootstrap]);
+
+  useEffect(() => {
+    if (!isDirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [isDirty]);
+
+  useEffect(() => {
+    if (!isDirty) return;
+    const onClickCapture = (e: MouseEvent) => {
+      const el = (e.target as HTMLElement | null)?.closest?.("a[href]");
+      if (!el || !(el instanceof HTMLAnchorElement)) return;
+      const href = el.getAttribute("href");
+      if (!href || !isInternalNavHref(href)) return;
+      if (isSameDocumentLocation(href)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setPendingHref(el.href);
+      setLeaveModalOpen(true);
+    };
+    document.addEventListener("click", onClickCapture, true);
+    return () => document.removeEventListener("click", onClickCapture, true);
+  }, [isDirty]);
+
+  const persistDraft = async (data: Form): Promise<boolean> => {
+    const cover = bgimg?.trim() || null;
+    try {
+      if (!storyId) {
+        const created = await createStory({
+          title: data.title.trim() || "Untitled story",
+          content: data.content,
+          status: "DRAFT",
+          bgimg: cover ?? undefined,
+        });
+        setStoryId(created.id);
+        const savedCover = created.bgimg?.trim() ?? null;
+        setBgimg(savedCover);
+        const snap = {
+          title: created.title ?? (data.title.trim() || "Untitled story"),
+          content: created.content ?? data.content,
+          bgimg: savedCover,
+        };
+        setSavedSnapshot(snap);
+        router.replace(`/editor?id=${created.id}`);
+      } else {
+        await saveDraftFlexible(storyId, {
+          title: data.title,
+          content: data.content,
+          bgimg: bgimg?.trim() ?? "",
+        });
+        setSavedSnapshot({
+          title: data.title,
+          content: data.content,
+          bgimg: cover,
+        });
+      }
+      toast.success("Draft saved");
+      return true;
+    } catch (e) {
+      toast.error(getApiErrorMessage(e, "Save failed"));
+      return false;
+    }
+  };
+
+  const saveDraftNow = handleSubmit(async (data) => {
+    useEditorChromeStore.getState().setBusy({ saving: true });
+    try {
+      await persistDraft(data);
+    } finally {
+      useEditorChromeStore.getState().setBusy({ saving: false });
+    }
+  });
+
+  const onPublish = handleSubmit(async (data) => {
+    useEditorChromeStore.getState().setBusy({ publishing: true });
+    try {
+      const cover = bgimg?.trim() || null;
+      let id = storyId;
+      if (!id) {
+        const created = await createStory({
+          title: data.title.trim() || "Untitled story",
+          content: data.content,
+          status: "DRAFT",
+          bgimg: cover ?? undefined,
+        });
+        id = created.id;
+        setStoryId(id);
+        const savedCover = created.bgimg?.trim() ?? null;
+        setBgimg(savedCover);
+        setSavedSnapshot({
+          title: created.title ?? (data.title.trim() || "Untitled story"),
+          content: created.content ?? data.content,
+          bgimg: savedCover,
+        });
+        router.replace(`/editor?id=${id}`);
+      }
+      try {
+        await updateStory(id, {
+          title: data.title,
+          content: data.content,
+          status: "DRAFT",
+          bgimg: cover ?? undefined,
+        });
+        await publishStory(id);
+        toast.success("Published!");
+        window.location.assign(`/story/${id}`);
+      } catch (e) {
+        try {
+          await updateStory(id, {
+            title: data.title,
+            content: data.content,
+            status: "PUBLISHED",
+            bgimg: cover ?? undefined,
+          });
+          toast.success("Published!");
+          window.location.assign(`/story/${id}`);
+        } catch (e2) {
+          toast.error(getApiErrorMessage(e2 ?? e, "Publish failed"));
+        }
+      }
+    } finally {
+      useEditorChromeStore.getState().setBusy({ publishing: false });
+    }
+  });
+
+  const saveDraftNowRef = useRef(saveDraftNow);
+  const onPublishRef = useRef(onPublish);
+  saveDraftNowRef.current = saveDraftNow;
+  onPublishRef.current = onPublish;
+
+  useEffect(() => {
+    const { register, clear } = useEditorChromeStore.getState();
+    register({
+      saveDraft: () => void saveDraftNowRef.current(),
+      publish: () => void onPublishRef.current(),
+    });
+    return () => clear();
+  }, []);
+
+  const navigateAfterLeave = useCallback(
+    (href: string) => {
+      setLeaveModalOpen(false);
+      setPendingHref(null);
+      const path = normalizeInternalHref(href);
+      if (path.startsWith("/")) {
+        router.push(path);
+      } else {
+        window.location.assign(href);
+      }
+    },
+    [router],
+  );
+
+  const handleLeaveCancel = () => {
+    setLeaveModalOpen(false);
+    setPendingHref(null);
+  };
+
+  const handleLeaveDiscard = () => {
+    if (pendingHref) navigateAfterLeave(pendingHref);
+    else handleLeaveCancel();
+  };
+
+  const handleLeaveSave = async () => {
+    const target = pendingHref;
+    if (!target) return;
+    const data = getValues();
+    useEditorChromeStore.getState().setBusy({ saving: true });
+    try {
+      const ok = await persistDraft(data);
+      if (ok) navigateAfterLeave(target);
+    } finally {
+      useEditorChromeStore.getState().setBusy({ saving: false });
+    }
+  };
+
+  const contentLen = (content ?? "").length;
+
+  const openCoverPicker = useCallback(() => {
+    setCoverCandidates(randomPicsumCoverCandidates());
+    setCoverPickerOpen(true);
+  }, []);
+
+  const { ref: titleRef, ...titleRegister } = register("title");
+
+  const addTag = () => {
+    const raw = tagInput.trim().replace(/^#+/, "");
+    if (!raw) return;
+    if (tags.includes(raw)) {
+      setTagInput("");
+      return;
+    }
+    setTags((t) => [...t, raw]);
+    setTagInput("");
+  };
+
+  if (initializing) {
+    return <PageLoader />;
+  }
+
+  return (
+    <>
+      <main className="relative w-full flex-1 bg-editorial-surface">
+          <div className="pointer-events-none fixed top-20 right-[5%] -z-10 opacity-20">
+            <PenLine className="size-24 text-tertiary-fixed-dim sm:size-[120px]" strokeWidth={0.75} />
+          </div>
+
+          <div className="fixed bottom-32 left-6 z-10 hidden opacity-40 xl:block">
+            <div className="editor-cloud-shape flex size-24 items-center justify-center bg-tertiary-fixed-dim">
+              <Star className="size-10 fill-primary text-primary" strokeWidth={0} />
+            </div>
+          </div>
+
+          <div className="fixed right-8 top-40 z-10 hidden w-64 rotate-3 rounded-editorial-xl bg-surface-container-low p-4 shadow-lg transition-transform duration-500 hover:rotate-0 lg:block">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={EDITOR_TIP_IMAGE}
+              alt={editorTip.imageAlt}
+              className="mb-4 h-40 w-full rounded-lg object-cover"
+            />
+            <p className="font-headline mb-1 text-xs font-bold text-primary">EDITOR&apos;S TIP</p>
+            <p className="text-xs leading-relaxed text-on-surface-variant">{editorTip.body}</p>
+          </div>
+
+          <div className="mx-auto max-w-4xl px-5 pt-8 pb-16 sm:px-6 sm:pt-12 sm:pb-24">
+            <div className="mb-10 sm:mb-12">
+              <textarea
+                ref={titleRef}
+                rows={2}
+                placeholder="The story starts here..."
+                className="w-full resize-none border-none bg-transparent p-0 font-headline text-4xl font-black leading-tight tracking-tight text-on-surface placeholder:opacity-20 focus:ring-0 focus:outline-none sm:text-5xl md:text-6xl lg:text-7xl"
+                {...titleRegister}
+              />
+              {errors.title?.message ? (
+                <p className="mt-2 text-sm text-error" role="alert">
+                  {errors.title.message}
+                </p>
+              ) : null}
+
+              <div className="mt-6 flex flex-wrap items-center gap-3 sm:gap-4">
+                <div className="flex items-center gap-2 rounded-full bg-surface-container-low px-4 py-2">
+                  <Tag className="size-4 shrink-0 text-primary" strokeWidth={2} />
+                  <input
+                    type="text"
+                    value={tagInput}
+                    onChange={(e) => setTagInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        addTag();
+                      }
+                    }}
+                    className="w-28 border-none bg-transparent p-0 text-sm font-medium text-on-surface placeholder:text-on-surface-variant focus:ring-0 focus:outline-none sm:w-32"
+                    placeholder="Add tags..."
+                  />
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {tags.map((t) => (
+                    <span
+                      key={t}
+                      className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-3 py-1 text-xs font-bold text-primary"
+                    >
+                      #{t}
+                      <button
+                        type="button"
+                        className="rounded-full p-0.5 hover:bg-primary/20"
+                        aria-label={`Remove ${t}`}
+                        onClick={() => setTags((prev) => prev.filter((x) => x !== t))}
+                      >
+                        <X className="size-3" strokeWidth={2.5} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <article className="serif-editor min-h-[min(512px,50vh)]">
+              <Controller
+                name="content"
+                control={control}
+                render={({ field }) => (
+                  <RichMarkdownEditor
+                    ref={richEditorHandle}
+                    editorRootRef={richRootRef}
+                    id="content"
+                    value={field.value}
+                    onChange={field.onChange}
+                    placeholder="Start typing your story… Use the toolbar for bold, lists, and more. Your words show formatted as you write."
+                    aria-invalid={!!errors.content}
+                    className={cn(
+                      errors.content &&
+                        "ring-2 ring-error/40 ring-offset-2 ring-offset-editorial-surface",
+                    )}
+                  />
+                )}
+              />
+              <div className="mt-3 flex justify-between gap-4 text-xs text-on-surface-variant">
+                <span>
+                  {errors.content?.message ? (
+                    <span className="text-error" role="alert">
+                      {errors.content.message}
+                    </span>
+                  ) : (
+                    <span>
+                      <strong className="font-semibold text-on-surface/80">Tip:</strong> use{" "}
+                      <strong>Cover</strong> in the bar for the story banner. Inline photos:{" "}
+                      <code className="rounded bg-surface-container-high px-1 py-0.5 font-mono text-[10px]">
+                        ![alt](url)
+                      </code>
+                    </span>
+                  )}
+                </span>
+                <span className="tabular-nums opacity-70">{contentLen.toLocaleString()} chars</span>
+              </div>
+            </article>
+          </div>
+
+        <div className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 px-4 sm:bottom-8">
+          <div className="glass-editor-toolbar pointer-events-auto flex items-center gap-0.5 rounded-full border border-outline-variant/20 p-2 shadow-xl md:gap-1">
+            <EditorToolbar
+              variant="floating"
+              richRootRef={richRootRef}
+              onAfterRichCommand={() => richEditorHandle.current?.flush()}
+              onOpenCoverPicker={openCoverPicker}
+              setContent={setContentValue}
+            />
+          </div>
+        </div>
+      </main>
+
+      <Modal
+        open={coverPickerOpen}
+        onClose={() => setCoverPickerOpen(false)}
+        title="Choose cover image"
+        variant="editorial"
+        className="max-w-2xl"
+      >
+        <p className="mb-4 font-login-body text-sm leading-relaxed text-on-secondary-container sm:text-base">
+          Pick one image for the story banner (feed and story page). It is not inserted into the
+          article text.
+        </p>
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          {coverCandidates.map((url) => (
+            <button
+              key={url}
+              type="button"
+              onClick={() => {
+                setBgimg(url);
+                setCoverPickerOpen(false);
+                toast.success("Cover selected — save draft to keep it.");
+              }}
+              className="group overflow-hidden rounded-xl ring-offset-2 transition-shadow hover:ring-2 hover:ring-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                alt=""
+                className="aspect-video w-full object-cover transition-transform group-hover:scale-105"
+                src={url}
+              />
+            </button>
+          ))}
+        </div>
+      </Modal>
+
+      <Modal
+        open={leaveModalOpen}
+        onClose={handleLeaveCancel}
+        title="Save draft?"
+        variant="editorial"
+      >
+        <p className="mb-6 font-login-body text-sm leading-relaxed text-on-secondary-container sm:text-base">
+          You have unsaved changes. Save your draft before leaving, or leave without saving.
+        </p>
+        <div className="flex flex-row flex-nowrap items-center justify-end gap-2 overflow-x-auto">
+          <button
+            type="button"
+            className="shrink-0 rounded-full border border-outline-variant/35 px-4 py-2.5 font-headline text-xs font-bold text-on-background transition-colors hover:border-primary/40 hover:bg-primary/8 hover:text-primary sm:px-5 sm:text-sm"
+            onClick={handleLeaveCancel}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="shrink-0 rounded-full border border-outline-variant/25 px-4 py-2.5 font-headline text-xs font-bold text-on-secondary-container transition-colors hover:border-error/35 hover:bg-error/8 hover:text-error sm:px-5 sm:text-sm"
+            onClick={handleLeaveDiscard}
+          >
+            Leave without saving
+          </button>
+          <button
+            type="button"
+            disabled={saving}
+            className="inline-flex shrink-0 items-center justify-center gap-2 rounded-full bg-primary px-4 py-2.5 font-headline text-xs font-bold text-on-primary shadow-md transition-all hover:bg-primary-container disabled:pointer-events-none disabled:opacity-60 sm:px-6 sm:text-sm"
+            onClick={() => void handleLeaveSave()}
+          >
+            {saving ? (
+              <span
+                className="size-4 animate-spin rounded-full border-2 border-current border-t-transparent"
+                aria-hidden
+              />
+            ) : null}
+            Save draft
+          </button>
+        </div>
+      </Modal>
+    </>
+  );
+}
