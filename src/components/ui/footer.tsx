@@ -5,7 +5,7 @@ import { useLegalModalStore } from "@/store/legalModalStore";
 import { BrandLogo } from "@/components/ui/brand-logo";
 import { cn } from "@/lib/cn";
 
-const PORTFOLIO_URL = "https://abhishek02-portfolio.vercel.app/";
+const PORTFOLIO_URL = "https://Aryan Rathore02-portfolio.vercel.app/";
 
 const linkClass =
   "font-login-label text-sm tracking-wide text-[#e7e7d8] uppercase opacity-60 transition-opacity duration-200 hover:text-[#f43651] hover:opacity-100";
@@ -61,7 +61,7 @@ export function Footer({ className }: FooterProps) {
               rel="noopener noreferrer"
               className="font-semibold text-[#e7e7d8]/70 underline decoration-[#e7e7d8]/30 underline-offset-2 hover:text-[#f43651]"
             >
-              Abhishek
+              Aryan Rathore
             </a>
           </p>
         </div>
